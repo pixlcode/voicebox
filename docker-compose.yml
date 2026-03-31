@@ -3,10 +3,10 @@ services:
     build: .
     container_name: voicebox
     restart: unless-stopped
+    runtime: nvidia
 
     ports:
-      # Bind to localhost only for security
-      - "127.0.0.1:17493:17493"
+      - "17493:17493"
 
     volumes:
       # Bind-mount for generated audio (customize the host path as needed)
@@ -22,12 +22,18 @@ services:
 
     environment:
       - LOG_LEVEL=info
+      - CUDA_VISIBLE_DEVICES=0
 
     networks:
       - voicebox-net
 
     deploy:
       resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
         limits:
           cpus: '4'
           memory: 8G

@@ -273,35 +273,47 @@ class PyTorchSTTBackend:
     load_model = load_model_async
 
     def _load_model_sync(self, model_size: str):
-        """Synchronous model loading."""
+        """Synchronous model loading using faster-whisper."""
+        import faster_whisper
+        
         progress_model_name = f"whisper-{model_size}"
         is_cached = self._is_model_cached(model_size)
 
         with model_load_progress(progress_model_name, is_cached):
-            from transformers import WhisperProcessor, WhisperForConditionalGeneration
-
-            model_name = WHISPER_HF_REPOS.get(model_size, f"openai/whisper-{model_size}")
-            logger.info("Loading Whisper model %s on %s...", model_size, self.device)
-
-            with force_offline_if_cached(is_cached, progress_model_name):
-                self.processor = WhisperProcessor.from_pretrained(model_name)
-                self.model = WhisperForConditionalGeneration.from_pretrained(model_name)
-
-        self.model.to(self.device)
-        self.model_size = model_size
-        logger.info("Whisper model %s loaded successfully", model_size)
+            # Map model sizes to faster-whisper model names
+            model_map = {
+                "tiny": "tiny",
+                "base": "base",
+                "small": "small",
+                "medium": "medium",
+                "large": "large-v3",
+                "turbo": "large-v3-turbo",
+            }
+            hf_model = model_map.get(model_size, "base")
+            
+            # Determine compute type - int8 is faster, float16 is more accurate
+            compute_type = "int8" if torch.cuda.is_available() else "float16"
+            
+            logger.info("Loading faster-whisper model %s with compute_type=%s...", hf_model, compute_type)
+            
+            self.model = faster_whisper.WhisperModel(
+                hf_model,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                compute_type=compute_type,
+            )
+            
+            self.model_size = model_size
+            logger.info("Faster-whisper model %s loaded successfully", model_size)
 
     def unload_model(self):
         """Unload the model to free memory."""
         if self.model is not None:
             del self.model
-            del self.processor
             self.model = None
-            self.processor = None
 
             empty_device_cache(self.device)
 
-            logger.info("Whisper model unloaded")
+            logger.info("Faster-whisper model unloaded")
 
     async def transcribe(
         self,
@@ -310,54 +322,44 @@ class PyTorchSTTBackend:
         model_size: Optional[str] = None,
     ) -> str:
         """
-        Transcribe audio to text.
+        Transcribe audio to text using faster-whisper.
 
         Args:
             audio_path: Path to audio file
-            language: Optional language hint
-            model_size: Optional model size override
+            language: Language code (optional, auto-detected if not provided)
+            model_size: Model size to use
 
         Returns:
             Transcribed text
         """
+        if model_size is None:
+            model_size = self.model_size
+
+        # Load model if not already loaded
         await self.load_model_async(model_size)
 
         def _transcribe_sync():
             """Run synchronous transcription in thread pool."""
-            # Load audio
-            audio, sr = load_audio(audio_path, sample_rate=16000)
-
-            # Process audio
-            inputs = self.processor(
-                audio,
-                sampling_rate=16000,
-                return_tensors="pt",
+            logger.info("Transcribing audio with faster-whisper...")
+            
+            # Run transcription
+            segments, info = self.model.transcribe(
+                audio_path,
+                language=language,
+                beam_size=1,  # Faster than default 5
+                vad_filter=True,  # Voice activity detection
+                vad_parameters=dict(min_silence_duration_ms=500),
             )
-            inputs = inputs.to(self.device)
-
-            # Generate transcription
-            # If language is provided, force it; otherwise let Whisper auto-detect
-            generate_kwargs = {}
-            if language:
-                forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-                    language=language,
-                    task="transcribe",
-                )
-                generate_kwargs["forced_decoder_ids"] = forced_decoder_ids
-
-            with torch.no_grad():
-                predicted_ids = self.model.generate(
-                    inputs["input_features"],
-                    **generate_kwargs,
-                )
-
-            # Decode
-            transcription = self.processor.batch_decode(
-                predicted_ids,
-                skip_special_tokens=True,
-            )[0]
-
-            return transcription.strip()
+            
+            # Collect all segments
+            result_segments = []
+            for segment in segments:
+                result_segments.append(segment.text)
+            
+            result = " ".join(result_segments)
+            logger.info("Transcription completed: %s", result[:100])
+            return result
 
         # Run blocking transcription in thread pool
-        return await asyncio.to_thread(_transcribe_sync)
+        result = await asyncio.to_thread(_transcribe_sync)
+        return result
